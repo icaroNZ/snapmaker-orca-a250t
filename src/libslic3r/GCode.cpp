@@ -11,6 +11,7 @@
 #include "EdgeGrid.hpp"
 #include "Geometry/ConvexHull.hpp"
 #include "GCode/PrintExtents.hpp"
+#include "GCode/SnapmakerHeader.hpp"
 #include "GCode/Thumbnails.hpp"
 #include "GCode/WipeTower.hpp"
 #include "GCode/WipeTower2.hpp"
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <iostream>
 #include <numeric>
@@ -809,7 +811,14 @@ std::string WipeTowerIntegration::append_tcr2(GCode& gcodegen, const WipeTower::
         z = current_z;
 
     const bool will_go_down = !is_approx(z, current_z);
-    if (!tcr.priming && (tcr.is_finish_first || will_go_down)) {
+    // The final purge (new_extruder_id == -1) is not a real tool change: its G-code has no
+    // [change_filament_gcode], so nothing else lifts before its first move. Travel here
+    // with retract + lift, as v2.4.0 did.
+    const bool is_final_purge = new_extruder_id < 0;
+    if (!tcr.priming && (tcr.is_finish_first || will_go_down || is_final_purge)) {
+        if (is_final_purge)
+            BOOST_LOG_TRIVIAL(debug) << "final purge: retract + travel to the wipe tower at (" << start_pos.x() << ", " << start_pos.y()
+                                     << ") z=" << current_z;
         // Move over the wipe tower.
         gcode += gcodegen.retract();
         gcodegen.m_avoid_crossing_perimeters.use_external_mp_once();
@@ -831,9 +840,6 @@ std::string WipeTowerIntegration::append_tcr2(GCode& gcodegen, const WipeTower::
     const bool is_ramming = (gcodegen.config().single_extruder_multi_material) ||
         (!gcodegen.config().single_extruder_multi_material &&
             get_value_at(gcodegen.config(), gcodegen.config().filament_multitool_ramming, ConfigFlowDomain::Filament, tcr.initial_tool));
-    const bool should_travel_to_tower = !tcr.priming && (tcr.force_travel     // wipe tower says so
-        || !needs_toolchange // this is just finishing the tower with no toolchange
-        || is_ramming);
 
     // Check whether this TCR carries a separate nozzle change (ramming) result.
     bool has_nozzle_change = !tcr.nozzle_change_result.gcode.empty()
@@ -2616,6 +2622,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
 
     m_enable_cooling_markers = true;
     this->apply_print_config(print.config());
+    // #1064: as upstream OrcaSlicer, apply the global object/region settings so region options read below (such as
+    // small_area_infill_flow_compensation) see the user's value instead of the FullPrintConfig default.
+    m_config.apply(print.default_object_config());
+    m_config.apply(print.default_region_config());
 
     // m_volumetric_speed = DoExport::autospeed_volumetric_limit(print);
     print.throw_if_canceled();
@@ -2631,12 +2641,70 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
 
     if (m_config.small_area_infill_flow_compensation.value && !m_config.small_area_infill_flow_compensation_model.empty())
         m_small_area_infill_flow_compensator = make_unique<SmallAreaInfillFlowCompensator>(print.config());
+    BOOST_LOG_TRIVIAL(debug) << "small area flow compensation: " << (m_small_area_infill_flow_compensator ? "enabled" : "disabled")
+                             << " (option " << m_config.small_area_infill_flow_compensation.value << ", model lines "
+                             << m_config.small_area_infill_flow_compensation_model.values.size() << ")";
 
     // Orca: Don't output Header block if BTT thumbnail is identified in the list
     // Get the thumbnails value as a string
     std::string thumbnails_value = print.config().option<ConfigOptionString>("thumbnails")->value;
     // search string for the BTT_TFT label
     bool has_BTT_thumbnail = (thumbnails_value.find("BTT_TFT") != std::string::npos);
+
+    const bool snapmaker_header = !is_bbl_printers && SnapmakerHeader::is_snapmaker_2(print.config().printer_model.value);
+    GCodeThumbnails::GCodeThumbnailDefinitionsList thumbnails;
+    if (!is_bbl_printers && thumbnail_cb != nullptr) {
+        auto [definitions, errors] = GCodeThumbnails::make_and_check_thumbnail_list(print.full_print_config());
+        if (errors != enum_bitmask<ThumbnailError>()) {
+            std::string error_str = format("Invalid thumbnails value:");
+            error_str += GCodeThumbnails::get_error_string(errors);
+            throw Slic3r::ExportError(error_str);
+        }
+        thumbnails = std::move(definitions);
+    }
+
+    if (snapmaker_header) {
+        file.write(SnapmakerHeader::START);
+        file.write_format(";%s\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Snapmaker_Printing_Time_Placeholder).c_str());
+        // Guard the first object: the header is written before the slicing summary that also reads it.
+        const double sm2_layer_height = print.objects().empty() ? m_config.initial_layer_print_height.value :
+                                                                  print.objects().front()->config().layer_height.value;
+        file.write_format(";layer_height: %.3f\n", sm2_layer_height);
+        // The SM2 screen scans the entire file unless the header supplies retraction metadata.
+        for (size_t extruder_id = 0; extruder_id < std::min(size_t(2), m_config.nozzle_diameter.size()); ++extruder_id) {
+            file.write_format(";Extruder %zu Retraction Distance: %.3f\n", extruder_id,
+                              get_value_at(m_config, m_config.retraction_length, ConfigFlowDomain::Filament, extruder_id));
+            file.write_format(";Extruder %zu Switch Retraction Distance: %.3f\n", extruder_id,
+                              m_config.retract_length_toolchange.get_at(extruder_id));
+            file.write_format(extruder_id == 0 ? ";nozzle_temperature(\xC2\xB0" "C): %d\n" : ";nozzle_1_temperature(\xC2\xB0" "C): %d\n",
+                              get_value_at(m_config, m_config.nozzle_temperature_initial_layer, ConfigFlowDomain::Filament, extruder_id));
+        }
+        file.write_format(";build_plate_temperature(\xC2\xB0" "C): %d\n", get_bed_temperature_max(print, true));
+        size_t sm2_thumbnail_bytes = 0;
+        GCodeThumbnails::export_thumbnails_to_file(
+            thumbnail_cb, print.get_plate_index(), thumbnails,
+            [&file, &sm2_thumbnail_bytes](const char* sz) {
+                sm2_thumbnail_bytes += std::strlen(sz);
+                file.write(sz);
+            },
+            [&print]() { print.throw_if_canceled(); }, true);
+        file.write(";Header End\n\n");
+        if (sm2_thumbnail_bytes == 0)
+            BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0 header: no thumbnail written (thumbnail callback "
+                                       << (thumbnail_cb ? "set" : "missing") << ", " << thumbnails.size()
+                                       << " thumbnail sizes configured); the touchscreen will show no preview";
+        else
+            BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0 header written for '" << print.config().printer_model.value << "': thumbnail "
+                                    << (thumbnails.empty() ? std::string("?") :
+                                                             std::to_string(int(thumbnails.front().second.x())) + "x" +
+                                                                 std::to_string(int(thumbnails.front().second.y())))
+                                    << ", " << sm2_thumbnail_bytes << " bytes (line count is filled in by the G-code processor)";
+    } else if (!is_bbl_printers && (boost::starts_with(print.config().printer_model.value, "Snapmaker A2") ||
+                                    boost::starts_with(print.config().printer_model.value, "Snapmaker A3"))) {
+        // e.g. a future "Snapmaker A250T" model name that SnapmakerHeader::is_snapmaker_2() does not know (not Artisan/U1/J1).
+        BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0 header not written: printer_model '" << print.config().printer_model.value
+                                   << "' is not a known A250/A350 model";
+    }
 
     if (!has_BTT_thumbnail) {
         file.write_format("; HEADER_BLOCK_START\n");
@@ -2710,15 +2778,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
             file.write_format("; first_layer_temperature = %d\n", get_value_at(print.config(), print.config().nozzle_temperature_initial_layer, ConfigFlowDomain::Filament, 0));
             file.write("; CONFIG_BLOCK_END\n\n");
         } else if (thumbnail_cb != nullptr) {
-            // generate the thumbnails
-            auto [thumbnails, errors] = GCodeThumbnails::make_and_check_thumbnail_list(print.full_print_config());
-
-            if (errors != enum_bitmask<ThumbnailError>()) {
-                std::string error_str = format("Invalid thumbnails value:");
-                error_str += GCodeThumbnails::get_error_string(errors);
-                throw Slic3r::ExportError(error_str);
-            }
-
+            // Retain standard thumbnails for G-code import and print-host integrations.
             if (!thumbnails.empty())
                 GCodeThumbnails::export_thumbnails_to_file(
                     thumbnail_cb, print.get_plate_index(), thumbnails, [&file](const char* sz) { file.write(sz); },
@@ -3070,8 +3130,21 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
         // BBS: the single bed temperature value accommodates the highest-temperature filament of the print
         // (max over all used extruders instead of the initial extruder only).
         int bed_temp_single = 0;
-        for (const unsigned int extruder_id : print.extruders())
+        const std::vector<unsigned int> bed_temp_extruders = print.extruders(false, true);
+        for (const unsigned int extruder_id : bed_temp_extruders)
             bed_temp_single = std::max(bed_temp_single, first_bed_temp_opt->get_at(extruder_id));
+        {
+            // #1073: log which filaments set the bed temperature, and which support-only filaments were ignored
+            // because no support was generated for them.
+            std::string used, ignored;
+            for (const unsigned int extruder_id : bed_temp_extruders)
+                used += (used.empty() ? "" : ",") + std::to_string(extruder_id + 1);
+            for (const unsigned int extruder_id : print.extruders(false, false))
+                if (std::find(bed_temp_extruders.begin(), bed_temp_extruders.end(), extruder_id) == bed_temp_extruders.end())
+                    ignored += (ignored.empty() ? "" : ",") + std::to_string(extruder_id + 1);
+            BOOST_LOG_TRIVIAL(info) << "bed temperature: first layer " << bed_temp_single << " from filaments [" << used
+                                    << "]; support-only filaments without generated support ignored: [" << ignored << "]";
+        }
         this->placeholder_parser().set("bed_temperature_initial_layer_single", new ConfigOptionInt(bed_temp_single));
         this->placeholder_parser().set("bed_temperature_initial_layer_vector", new ConfigOptionString());
         this->placeholder_parser().set("chamber_temperature", new ConfigOptionInts(m_config.chamber_temperature));
@@ -4019,12 +4092,13 @@ int GCode::get_bed_temperature(const int extruder_id, const bool is_first_layer,
 
 // BBS
 // Max bed temperature over all used extruders (object/support/wipe tower/brim-introduced extruders),
+// where support filaments only count when support extrusions were actually generated,
 // so a compatible mixed print (e.g. PLA 65C + TPU 35C) always runs the highest bed temperature.
 // A value of 0 means the filament does not support the current bed type, and is naturally skipped by max().
 int GCode::get_bed_temperature_max(const Print& print, const bool is_first_layer) const
 {
     int max_bed_temp = 0;
-    for (const unsigned int extruder_id : print.extruders())
+    for (const unsigned int extruder_id : print.extruders(false, true))
         max_bed_temp = std::max(
             max_bed_temp, get_bed_temperature(extruder_id, is_first_layer, print.config().curr_bed_type));
     return max_bed_temp;
@@ -7895,9 +7969,11 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
         gcode += this->travel_to(path.first_point(), path.role(), "move to first " + description + " point",
                                  sloped == nullptr ? DBL_MAX : get_sloped_z(sloped->slope_begin.z_ratio));
         m_need_change_layer_lift_z = false;
-        // Orca: force restore Z after unknown last pos
+        // Orca: ensure Z matches planned layer height
         if (_last_pos_undefined && !slope_need_z_travel) {
-            gcode += this->writer().travel_to_z(m_last_layer_z, "force restore Z after unknown last pos", true);
+            BOOST_LOG_TRIVIAL(debug) << "restore Z after unknown pos: nominal " << m_nominal_z << " (last_layer_z " << m_last_layer_z
+                                     << ", z_offset " << m_config.z_offset.value << ")";
+            gcode += this->writer().travel_to_z(m_nominal_z, "ensure Z matches planned layer height", true);
         }
     }
 

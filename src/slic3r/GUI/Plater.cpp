@@ -11915,7 +11915,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 show_info(q, text, _L("Newer 3mf version"));
                             }
                         }
-                    } else if (!load_config) {
+                    } else if (!load_config && en_3mf_file_type != En3mfType::From_BBS) {
                         // reset config except color
                         for (ModelObject *model_object : model.objects) {
                             bool has_extruder = model_object->config.has("extruder");
@@ -11938,6 +11938,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 if (has_extruder) { model_volume->config.set("extruder", extruder_id); }
                             }
                         }
+                        BOOST_LOG_TRIVIAL(info) << "add 3mf: non-slicer 3MF, reset per-object/part settings (extruder kept) of "
+                                                << model.objects.size() << " objects";
+                    } else if (!load_config) {
+                        // #961: a 3MF made by this slicer keeps its per-object, part and modifier settings when added.
+                        size_t volumes = 0;
+                        for (const ModelObject *model_object : model.objects)
+                            volumes += model_object->volumes.size();
+                        BOOST_LOG_TRIVIAL(info) << "add 3mf: slicer-made 3MF, kept per-object/part settings of " << model.objects.size()
+                                                << " objects, " << volumes << " volumes";
                     }
 
                     // plate data

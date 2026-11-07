@@ -54,13 +54,13 @@ static void init_degenerate_raft_print(Print& print)
 
 // Two cubes on extruders 2 and 3 of a 3-extruder machine with the wipe tower enabled.
 // "filament_adhesiveness_category" is deliberately shorter than the extruder count (the
-// default single-entry value behaves the same way on a multi-extruder machine), so
-// extruder 3 resolves to a wrapped category that never takes part in a tool change.
-// Wipe tower blocks are only created for categories of tools that change, therefore
-// extruder 3 has no block of its own category and WipeTower2::finish_layer_new used to
-// dereference a null block when finishing a layer with the wall filament (Sentry:
-// EXC_BAD_ACCESS / KERN_INVALID_ADDRESS / 0x58).
-static void init_multi_extruder_print(Print& print, const std::string& adhesiveness_categories, int wall_filament)
+// default single-entry value behaves the same way on a multi-extruder machine).
+// WipeTower2::finish_layer_new used to dereference a null block when the wall filament's
+// category had no block of its own (Sentry: EXC_BAD_ACCESS / KERN_INVALID_ADDRESS / 0x58).
+// Print::_make_wipe_tower now pads the categories to the extruder count with the first
+// entry, as WipeTower2::set_extruder does, so extruder 3 shares extruder 1's category and
+// this print no longer reaches that path; it still guards slicing with a short list.
+static void init_multi_extruder_print(Print& print, const std::string& adhesiveness_categories, int wall_filament, bool gcode_comments = false)
 {
     DynamicPrintConfig config = Test::default_print_config();
     config.set_deserialize_strict({
@@ -71,6 +71,7 @@ static void init_multi_extruder_print(Print& print, const std::string& adhesiven
         { "enable_prime_tower",             true },
         { "filament_adhesiveness_category", adhesiveness_categories },
         { "wipe_tower_filament",            wall_filament },
+        { "gcode_comments",                 gcode_comments },
         { "machine_start_gcode",            "" },
         // Same validation constraint as above: relative-E Marlin needs G92 E0 per layer.
         { "layer_change_gcode",             "G92 E0" }
@@ -159,6 +160,57 @@ SCENARIO("Wipe tower with fully defined adhesiveness categories", "[WipeTower]")
                 const std::string gcode = Test::gcode(print);
                 REQUIRE(gcode.find("WIPE_TOWER_START") != std::string::npos);
                 REQUIRE(gcode.find("CP TOOLCHANGE START") != std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("Wipe tower with a single adhesiveness category for all extruders", "[WipeTower]")
+{
+    GIVEN("3 extruders, objects on extruders 2/3, the single-entry category of pre-2.4.1 presets")
+    {
+        Print print;
+        Test::init_multi_extruder_print(print, "100", 2);
+
+        WHEN("the print is sliced")
+        {
+            THEN("the tool changes between extruders 2 and 3 are kept")
+            {
+                const std::string gcode = Test::gcode(print);
+                REQUIRE(gcode.find("CP TOOLCHANGE START") != std::string::npos);
+                REQUIRE(gcode.find("\nT1") != std::string::npos);
+                REQUIRE(gcode.find("\nT2") != std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("The final purge travels to the wipe tower with a retract and lift (#1149)", "[WipeTower]")
+{
+    GIVEN("3 extruders, objects on extruders 2/3, G-code comments on")
+    {
+        Print print;
+        Test::init_multi_extruder_print(print, "50,60,70", 3, true);
+
+        WHEN("the G-code is exported")
+        {
+            const std::string gcode = Test::gcode(print);
+            THEN("the last tool-change block (the final purge) is preceded by its own 'Travel to a Wipe Tower' move")
+            {
+                const size_t final_purge = gcode.rfind("; CP TOOLCHANGE START");
+                REQUIRE(final_purge != std::string::npos);
+                REQUIRE(final_purge > 0);
+                const size_t last_layer = gcode.rfind(";LAYER_CHANGE", final_purge);
+                REQUIRE(last_layer != std::string::npos);
+                // The last layer's finish/empty-grid block (is_finish_first) also travels to the tower with the same comment,
+                // so the travel must come after the end marker of the block before the final purge, not just after the
+                // last layer change; otherwise this passes on the pre-#1150 code.
+                const size_t previous_block = gcode.rfind("; CP ", final_purge - 1);
+                REQUIRE(previous_block != std::string::npos);
+                const size_t travel = gcode.rfind("Travel to a Wipe Tower", final_purge);
+                REQUIRE(travel != std::string::npos);
+                CHECK(travel > last_layer);
+                CHECK(travel > previous_block);
             }
         }
     }

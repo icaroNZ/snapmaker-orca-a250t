@@ -55,62 +55,6 @@ void cache_token(const std::string& key, const std::string& token)
     g_token_cache[key] = token;
 }
 
-// Polls api/v1/status in the background so the touchscreen does not drop the session (it closes a session
-// after ~5 s without requests) while a long multipart upload or the start_print call is in flight.
-class SessionKeepAlive
-{
-public:
-    SessionKeepAlive(std::string url, std::string log_url) : m_url(std::move(url)), m_log_url(std::move(log_url))
-    {
-        m_thread = std::thread([this]() { run(); });
-    }
-    ~SessionKeepAlive()
-    {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stop = true;
-        }
-        m_cv.notify_all();
-        if (m_thread.joinable())
-            m_thread.join();
-        BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive stopped after " << m_polls << " polls, " << m_failures << " failed";
-    }
-
-private:
-    void run()
-    {
-        BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive started, GET " << m_log_url << " every " << proto::POLL_INTERVAL_MS << " ms";
-        std::unique_lock<std::mutex> lock(m_mutex);
-        while (!m_cv.wait_for(lock, std::chrono::milliseconds(proto::POLL_INTERVAL_MS), [this]() { return m_stop; })) {
-            lock.unlock();
-            unsigned status = 0;
-            std::string error;
-            auto http = Http::get(m_url);
-            http.timeout_connect(3)
-                .timeout_max(4)
-                .on_complete([&](std::string, unsigned s) { status = s; })
-                .on_error([&](std::string, std::string e, unsigned s) { status = s; error = std::move(e); })
-                .perform_sync();
-            ++m_polls;
-            if (status != 200) {
-                // Log failures only (a 2 s poll is not worth an info line each time).
-                if (++m_failures <= 3 || m_failures % 10 == 0)
-                    BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: keep-alive GET " << m_log_url << " -> HTTP " << status << " " << error;
-            }
-            lock.lock();
-        }
-    }
-
-    std::string             m_url;
-    std::string             m_log_url;
-    std::thread             m_thread;
-    std::mutex              m_mutex;
-    std::condition_variable m_cv;
-    bool                    m_stop { false };
-    std::atomic<int>        m_polls { 0 };
-    std::atomic<int>        m_failures { 0 };
-};
-
 void notify_user(const wxString& text)
 {
     const std::string utf8 = text.ToUTF8().data();
@@ -122,10 +66,121 @@ void notify_user(const wxString& text)
 
 } // namespace
 
+// Polls api/v1/status in the background so the touchscreen does not drop the session (it closes a session
+// after ~5 s without requests) while a long multipart upload, the start_print call, a blocking execute_code (bed
+// levelling) or the user's nozzle-zero jogging is in progress. Keeps the last status body for the levelling progress.
+class Snapmaker2::KeepAlive
+{
+public:
+    // `reconnect` (optional) runs once when a poll gets 401 (session dropped): it should re-POST api/v1/connect with the same
+    // approved token, which the touchscreen accepts without asking again.
+    KeepAlive(std::string url, std::string log_url, std::function<bool()> reconnect = {})
+        : m_url(std::move(url)), m_log_url(std::move(log_url)), m_reconnect(std::move(reconnect))
+    {
+        m_thread = std::thread([this]() { run(); });
+    }
+    ~KeepAlive()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cv.notify_all();
+        if (m_thread.joinable())
+            m_thread.join();
+        BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive stopped after " << m_polls << " polls, " << m_failures
+                                << " failed, longest gap between good polls " << m_longest_gap_ms << " ms";
+    }
+
+    std::string last_body() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_last_body;
+    }
+    unsigned last_status() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_last_status;
+    }
+
+private:
+    void run()
+    {
+        BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive started, GET " << m_log_url << " every " << proto::POLL_INTERVAL_MS << " ms";
+        using clock = std::chrono::steady_clock;
+        // REV-SM2-KEEPALIVE: schedule from the start of the previous request (not from its end) and cap a request at 3 s, so
+        // a slow reply cannot stretch the gap past the touchscreen's 5 s idle limit (it was up to 1.5 s + 4 s).
+        const auto interval = std::chrono::milliseconds(proto::POLL_INTERVAL_MS);
+        auto       next     = clock::now() + interval;
+        auto       last_ok  = clock::now();
+        bool       dropped  = false;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        while (!m_cv.wait_until(lock, next, [this]() { return m_stop; })) {
+            lock.unlock();
+            const auto started = clock::now();
+            next               = started + interval;
+            unsigned status = 0;
+            std::string body;
+            std::string error;
+            auto http = Http::get(m_url);
+            http.timeout_connect(3)
+                .timeout_max(3)
+                .on_complete([&](std::string b, unsigned s) { status = s; body = std::move(b); })
+                .on_error([&](std::string, std::string e, unsigned s) { status = s; error = std::move(e); })
+                .perform_sync();
+            ++m_polls;
+            if (status == 200) {
+                const long gap_ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(started - last_ok).count());
+                if (gap_ms > m_longest_gap_ms)
+                    m_longest_gap_ms = gap_ms;
+                if (dropped)
+                    BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive session back after " << gap_ms << " ms";
+                last_ok = started;
+                dropped = false;
+            } else {
+                // Log failures only (a 1.5 s poll is not worth an info line each time).
+                if (++m_failures <= 3 || m_failures % 10 == 0)
+                    BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: keep-alive GET " << m_log_url << " -> HTTP " << status << " " << error;
+                if (status == 401 && !dropped) {
+                    dropped = true;
+                    BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: session dropped by the touchscreen "
+                                               << std::chrono::duration_cast<std::chrono::milliseconds>(started - last_ok).count()
+                                               << " ms after the last good poll" << (m_reconnect ? ", reconnecting with the same token" : "");
+                    if (m_reconnect) {
+                        if (m_reconnect())
+                            BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: keep-alive reconnect succeeded";
+                        else
+                            BOOST_LOG_TRIVIAL(error) << "Snapmaker 2.0: keep-alive reconnect failed, the upload will probably end with HTTP 401";
+                    }
+                }
+            }
+            lock.lock();
+            m_last_status = status;
+            if (status == 200)
+                m_last_body = std::move(body);
+        }
+    }
+
+    std::string             m_url;
+    std::string             m_log_url;
+    std::thread             m_thread;
+    mutable std::mutex      m_mutex;
+    std::condition_variable m_cv;
+    bool                    m_stop { false };
+    std::string             m_last_body;
+    unsigned                m_last_status { 0 };
+    std::atomic<int>        m_polls { 0 };
+    std::atomic<int>        m_failures { 0 };
+    std::function<bool()>   m_reconnect;
+    std::atomic<long>       m_longest_gap_ms { 0 };
+};
+
 Snapmaker2::Snapmaker2(DynamicPrintConfig* config)
     : m_host(config->opt_string("print_host"))
     , m_saved_token(config->opt_string("printhost_apikey"))
 {}
+
+Snapmaker2::~Snapmaker2() { end_interactive(); }
 
 const char* Snapmaker2::get_name() const { return "Snapmaker 2.0"; }
 
@@ -201,6 +256,8 @@ wxString Snapmaker2::describe_failure(const char* step, const Response& r) const
         return format_error(r.body, r.error, 0) + "\n" +
                _L("Check the IP address, that the Snapmaker 2.0 is switched on and that Wi-Fi is connected on its touchscreen.");
     case Reply::Busy:
+        if (std::string(step) == "execute_code")
+            return _L("The Snapmaker 2.0 is printing or paused, so it refused the command. Finish or stop the job on the touchscreen first.");
         return _L("Another client (for example Luban) is connected to this Snapmaker 2.0 or is waiting for approval. "
                   "Disconnect it, or answer its request on the touchscreen, then try again.");
     case Reply::NotAuthorised:
@@ -216,7 +273,8 @@ wxString Snapmaker2::describe_failure(const char* step, const Response& r) const
     }
 }
 
-bool Snapmaker2::open_session(wxString& msg, proto::ConnectInfo& info, ApprovalUi ui, int approval_timeout_s) const
+bool Snapmaker2::open_session(wxString& msg, proto::ConnectInfo& info, ApprovalUi ui, int approval_timeout_s,
+                              const std::function<bool()>& cancelled) const
 {
     m_granted              = false;
     const std::string key  = proto::make_url(m_host, "");
@@ -278,7 +336,7 @@ bool Snapmaker2::open_session(wxString& msg, proto::ConnectInfo& info, ApprovalU
     BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: machine series '" << info.series << "', headType " << info.head_type << " ("
                             << proto::head_type_name(info.head_type) << "), enclosure " << info.has_enclosure;
 
-    if (!wait_for_approval(msg, ui, approval_timeout_s))
+    if (!wait_for_approval(msg, ui, approval_timeout_s, cancelled))
         return false;
 
     m_granted = true;
@@ -286,7 +344,7 @@ bool Snapmaker2::open_session(wxString& msg, proto::ConnectInfo& info, ApprovalU
     return true;
 }
 
-bool Snapmaker2::wait_for_approval(wxString& msg, ApprovalUi ui, int approval_timeout_s) const
+bool Snapmaker2::wait_for_approval(wxString& msg, ApprovalUi ui, int approval_timeout_s, const std::function<bool()>& cancelled) const
 {
     const auto  path     = proto::status_path(m_token);
     const auto  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(approval_timeout_s);
@@ -330,6 +388,11 @@ bool Snapmaker2::wait_for_approval(wxString& msg, ApprovalUi ui, int approval_ti
         for (int slept = 0; slept < proto::POLL_INTERVAL_MS; slept += 100) {
             if (dialog && !dialog->Pulse()) {
                 BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: approval wait cancelled by the user";
+                msg = _L("Cancelled while waiting for approval on the touchscreen.");
+                return false;
+            }
+            if (cancelled && cancelled()) {
+                BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: approval wait cancelled after " << polls << " status poll(s)";
                 msg = _L("Cancelled while waiting for approval on the touchscreen.");
                 return false;
             }
@@ -383,6 +446,85 @@ nlohmann::json Snapmaker2::get_auth_info()
     return j;
 }
 
+bool Snapmaker2::begin_interactive(wxString& msg, proto::ConnectInfo& info)
+{
+    // Reconnecting: stop the old keep-alive first, it would poll with the old token.
+    m_keep_alive.reset();
+    BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: opening an interactive session (bed levelling) to " << m_host;
+    if (!open_session(msg, info, ApprovalUi::ProgressDialog, TEST_APPROVAL_TIMEOUT_S)) {
+        BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: interactive session not opened: " << msg.ToUTF8().data();
+        return false;
+    }
+    m_keep_alive = std::make_unique<KeepAlive>(proto::make_url(m_host, proto::status_path(m_token)), log_url(proto::status_path(m_token)));
+    return true;
+}
+
+void Snapmaker2::end_interactive()
+{
+    if (!m_keep_alive)
+        return;
+    m_keep_alive.reset();
+    BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: closing the interactive session";
+    close_session();
+}
+
+std::string Snapmaker2::last_status_body() const { return m_keep_alive ? m_keep_alive->last_body() : std::string(); }
+
+unsigned Snapmaker2::last_status_http() const { return m_keep_alive ? m_keep_alive->last_status() : 0; }
+
+Snapmaker2::Response Snapmaker2::execute_code(const std::string& line, long timeout_s, const std::atomic<bool>* cancel) const
+{
+    Response   r;
+    const auto fields = proto::execute_code_fields(m_token, line);
+    const auto path   = std::string("api/v1/execute_code");
+    BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: POST " << log_url(path) << " code '" << fields[1].second << "' (timeout " << timeout_s << " s)";
+
+    const auto start = std::chrono::steady_clock::now();
+    auto       http  = Http::post(proto::make_url(m_host, path));
+    http.header("Content-Type", "application/x-www-form-urlencoded")
+        .set_post_body(proto::form_body(fields))
+        .timeout_connect(CONNECT_TIMEOUT_S)
+        .timeout_max(timeout_s)
+        .on_complete([&](std::string b, unsigned status) {
+            r.status = status;
+            r.body   = std::move(b);
+        })
+        .on_error([&](std::string b, std::string error, unsigned status) {
+            r.status = status;
+            r.body   = std::move(b);
+            r.error  = std::move(error);
+        })
+        .on_progress([&](Http::Progress, bool& cancel_request) {
+            // libcurl calls this about once a second while it waits for the (late) reply.
+            if (cancel != nullptr && cancel->load()) {
+                cancel_request = true;
+                r.cancelled    = true;
+            }
+        })
+        .perform_sync();
+    r.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    r.kind      = proto::classify(r.status);
+
+    if (r.cancelled)
+        BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: stopped waiting for '" << fields[1].second << "' after " << r.elapsed_s
+                                   << " s (cancelled by the user; the machine keeps running it)";
+    else if (r.kind == proto::Reply::Ok) {
+        // Log the end of the output: a heated G1029 A answers with a temperature line per second of heat-up, and the
+        // lines that say how it ended ("heat soak done", "heat soak aborted: ...", "auto probing fail !") come last.
+        constexpr size_t tail_len = 600;
+        const std::string output  = r.body.size() <= tail_len ?
+                                        r.body :
+                                        "...(" + std::to_string(r.body.size()) + " bytes) " + r.body.substr(r.body.size() - tail_len);
+        BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: '" << fields[1].second << "' -> HTTP " << r.status << " after " << r.elapsed_s
+                                << " s, output: '" << output << "'";
+    }
+    else
+        BOOST_LOG_TRIVIAL(warning) << "Snapmaker 2.0: '" << fields[1].second << "' -> HTTP " << r.status << " ("
+                                   << proto::reply_name(r.kind) << ") after " << r.elapsed_s << " s, error: '" << r.error
+                                   << "' body: '" << proto::truncate(r.body) << "'";
+    return r;
+}
+
 bool Snapmaker2::upload(PrintHostUpload upload_data, ProgressFn progress_fn, ErrorFn error_fn, InfoFn /*info_fn*/) const
 {
     const std::string filename = upload_data.upload_path.filename().empty() ? upload_data.source_path.filename().string() :
@@ -403,7 +545,24 @@ bool Snapmaker2::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Err
 
     wxString           msg;
     proto::ConnectInfo info;
-    if (!open_session(msg, info, ApprovalUi::Notification, UPLOAD_APPROVAL_TIMEOUT_S)) {
+    // REV-SM2-CANCEL: the upload queue only learns about Cancel (or app shutdown) through progress_fn, which used to be
+    // called only once the file transfer ran; ask it every 100 ms while the touchscreen approval is pending.
+    bool              upload_cancelled = false;
+    const std::string no_buffer;
+    const auto        cancel_probe = [&]() {
+        if (progress_fn && !upload_cancelled)
+            progress_fn(Http::Progress(0, 0, 0, 0, no_buffer), upload_cancelled);
+        return upload_cancelled;
+    };
+    if (!open_session(msg, info, ApprovalUi::Notification, UPLOAD_APPROVAL_TIMEOUT_S, cancel_probe)) {
+        if (upload_cancelled) {
+            // Withdraw the pending request on the touchscreen and tell the queue the job is cancelled (no error dialog).
+            close_session();
+            BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: upload cancelled while waiting for approval, disconnect sent";
+            bool cancel = true;
+            progress_fn(Http::Progress(0, 0, 0, 0, no_buffer), cancel);
+            return false;
+        }
         error_fn(get_test_failed_msg(msg));
         return false;
     }
@@ -426,7 +585,9 @@ bool Snapmaker2::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Err
 
     bool result = true;
     {
-        SessionKeepAlive keep_alive(proto::make_url(m_host, proto::status_path(m_token)), log_url(proto::status_path(m_token)));
+        KeepAlive keep_alive(proto::make_url(m_host, proto::status_path(m_token)), log_url(proto::status_path(m_token)), [this]() {
+            return post_form("api/v1/connect", { { "token", m_token } }, SHORT_REQUEST_TIMEOUT_S).kind == proto::Reply::Ok;
+        });
 
         // prepare_print loads the file into the touchscreen workspace (same call Luban uses), fields as in Luban:
         // token, type=3DP, file.
@@ -434,6 +595,7 @@ bool Snapmaker2::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Err
         BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: POST " << log_url(path) << " multipart token, type=" << proto::FILE_TYPE_3DP << ", file='"
                                 << filename << "'";
         Response r;
+        bool     body_sent = false;
         auto     http = Http::post(proto::make_url(m_host, path));
         http.form_add("token", m_token)
             .form_add("type", proto::FILE_TYPE_3DP)
@@ -449,6 +611,11 @@ bool Snapmaker2::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Err
                 r.error  = std::move(error);
             })
             .on_progress([&](Http::Progress progress, bool& cancel) {
+                if (!body_sent && progress.ultotal > 0 && progress.ulnow == progress.ultotal) {
+                    // The file is on the wire; what follows is the touchscreen writing it (where a dropped session shows as 401).
+                    body_sent = true;
+                    BOOST_LOG_TRIVIAL(info) << "Snapmaker 2.0: upload body sent (" << progress.ultotal << " bytes), waiting for the reply";
+                }
                 Http::Progress prog = std::move(progress);
                 // Keep the progress bar below 100 % until start_print has been sent as well (same trick as ESP3D).
                 if (start && prog.ulnow > 0)
