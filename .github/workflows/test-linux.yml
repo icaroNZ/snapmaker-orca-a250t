@@ -218,3 +218,4 @@ jobs:
           name: test-report-${{ matrix.os }}
           path: build/test-report.html
           if-no-files-found: warn
+# ci-snapshot: registered on icaroNZ/snapmaker-orca-a250t

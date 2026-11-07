@@ -157,3 +157,4 @@ jobs:
         asset_name: Snapmaker_Orca-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}_Beta.flatpak
         asset_content_type: application/octet-stream
         max_releases: 1 # optional, if there are more releases than this matching the asset_name, the oldest ones are going to be deleted
+# ci-snapshot: registered on icaroNZ/snapmaker-orca-a250t
